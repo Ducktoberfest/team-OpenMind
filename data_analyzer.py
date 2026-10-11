@@ -290,6 +290,9 @@ def validate_op(op: dict, columns: list) -> dict:
             "columns siyahı olmalıdır."
         )
 
+    if not all(isinstance(column, str) for column in columns):
+        raise ValueError("Sütun adları mətn (string) olmalıdır.")
+
     if len(columns) != len(set(columns)):
         raise ValueError(
             "Təkrarlanan sütun adları dəstəklənmir."
@@ -509,15 +512,20 @@ def _apply_filters(
                 )
 
         elif pd.api.types.is_datetime64_any_dtype(series):
-            try:
-                value = pd.to_datetime(
-                    value,
-                    errors="raise",
-                )
-            except (ValueError, TypeError):
+            if not isinstance(value, str):
+                raise ValueError("Tarix filteri aydın mətn formatında olmalıdır.")
+            date_text = value
+            parsed = _parse_trend_dates(pd.Series([date_text])).iloc[0]
+            if pd.isna(parsed):
                 raise ValueError(
-                    f"Yanlış tarix filteri: {value}"
+                    f"Yanlış və ya qeyri-müəyyən tarix filteri: {value}"
                 )
+            value = parsed
+            if series.dt.tz is not None:
+                if re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", date_text, re.IGNORECASE):
+                    value = value.tz_localize("UTC").tz_convert(series.dt.tz)
+                else:
+                    value = value.tz_localize(series.dt.tz)
 
         else:
             if operator not in {"==", "!="}:
@@ -601,35 +609,55 @@ def _parse_trend_dates(series: pd.Series) -> pd.Series:
 
     values = series.astype("string").str.strip()
 
-    iso_mask = values.str.fullmatch(
-        r"\d{4}-\d{2}-\d{2}",
-        na=False,
-    )
-
     parsed = pd.Series(
         pd.NaT,
         index=series.index,
         dtype="datetime64[ns]",
     )
 
-    if iso_mask.any():
-        parsed.loc[iso_mask] = pd.to_datetime(
-            values.loc[iso_mask],
-            format="%Y-%m-%d",
-            errors="coerce",
-        )
+    # Use explicit formats; never guess between month/day and day/month.
+    for pattern, date_format in (
+        (r"\d{4}-\d{1,2}-\d{1,2}", "%Y-%m-%d"),
+        (r"\d{4}/\d{1,2}/\d{1,2}", "%Y/%m/%d"),
+        (r"[A-Za-z]+ \d{1,2}, \d{4}", "%b %d, %Y"),
+        (r"[A-Za-z]+ \d{1,2}, \d{4}", "%B %d, %Y"),
+        (r"\d{1,2} [A-Za-z]+ \d{4}", "%d %b %Y"),
+        (r"\d{1,2} [A-Za-z]+ \d{4}", "%d %B %Y"),
+    ):
+        mask = values.str.fullmatch(pattern, na=False) & parsed.isna()
+        if mask.any():
+            parsed.loc[mask] = pd.to_datetime(
+                values.loc[mask], format=date_format, errors="coerce"
+            )
 
-    # ISO olmayan tarixlər üçün pandas mixed parsing.
-    # Qeyri-müəyyən formatlar tətbiqdə ayrıca yoxlanmalıdır.
-    other_mask = values.notna() & ~iso_mask
-
-    if other_mask.any():
-        parsed.loc[other_mask] = pd.to_datetime(
-            values.loc[other_mask],
-            format="mixed",
-            dayfirst=True,
-            errors="coerce",
+    for separator in ("/", ".", "-"):
+        parts = values.str.extract(
+            rf"^(\d{{1,2}}){re.escape(separator)}(\d{{1,2}})"
+            rf"{re.escape(separator)}(\d{{4}})$"
         )
+        first = pd.to_numeric(parts[0], errors="coerce")
+        second = pd.to_numeric(parts[1], errors="coerce")
+        day_first = (first > 12) & second.between(1, 12)
+        month_first = first.between(1, 12) & (second > 12)
+        equal = first.eq(second) & first.between(1, 12)
+        for mask, date_format in (
+            (day_first | equal, f"%d{separator}%m{separator}%Y"),
+            (month_first, f"%m{separator}%d{separator}%Y"),
+        ):
+            if mask.any():
+                parsed.loc[mask] = pd.to_datetime(
+                    values.loc[mask], format=date_format, errors="coerce"
+                )
+
+    # ISO timestamps specify their calendar order explicitly. Normalize a
+    # timezone offset to UTC so mixed offsets can still form one trend index.
+    iso_time = values.str.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}.*", na=False
+    )
+    if iso_time.any():
+        parsed.loc[iso_time] = pd.to_datetime(
+            values.loc[iso_time], format="ISO8601", errors="coerce", utc=True
+        ).dt.tz_localize(None)
 
     return parsed
 
@@ -729,13 +757,14 @@ def run_operation(
         else:
             method = kind.split("_")[1]
 
-            grouped = getattr(
-                filtered.groupby(
-                    group_col,
-                    dropna=False,
-                )[metric],
-                method,
-            )()
+            aggregate = filtered.groupby(
+                group_col, dropna=False,
+            )[metric]
+            grouped = (
+                aggregate.sum(min_count=1)
+                if method == "sum"
+                else aggregate.mean()
+            )
 
             value_name = metric
 
@@ -750,14 +779,14 @@ def run_operation(
 
         grouped = grouped.head(top_n)
 
-        table = grouped.reset_index()
-
-        table.columns = [
-            group_col,
-            value_name,
-        ]
+        # The grouped index and aggregate must have distinct names, including
+        # group_count grouped by a column literally named "count".
+        if value_name == group_col:
+            value_name = f"{value_name}_{kind.removeprefix('group_')}"
+        table = grouped.rename(value_name).reset_index()
 
         result["group_by"] = group_col
+        result["value_column"] = value_name
         result["table"] = [
             {
                 str(k): _json_value(v)
@@ -771,6 +800,7 @@ def run_operation(
     # --------------------------------------------------------
 
     elif kind == "trend":
+        value_name = "period_sum" if metric == "period" else metric
         date_col = _find_date_column(
             filtered,
             op.get("date_col"),
@@ -813,12 +843,13 @@ def run_operation(
             for date, value in aggregated.items():
                 table.append({
                     "period": date.strftime("%Y-%m-%d"),
-                    metric: _safe_number(value),
+                    value_name: _safe_number(value),
                 })
 
         result["date_col"] = date_col
         result["freq"] = freq
         result["invalid_dates"] = invalid_dates
+        result["value_column"] = value_name
         result["rows_used"] = int(len(trend_df))
         result["table"] = table
 

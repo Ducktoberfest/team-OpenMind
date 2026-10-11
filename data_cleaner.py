@@ -1,23 +1,73 @@
 """Üzv 1: faylın oxunması, keyfiyyət yoxlaması, təhlükəsiz təmizləmə."""
 from __future__ import annotations
 
+import csv
+import io
+import math
+import os
 import re
+from datetime import datetime
 from typing import Tuple
 
 import pandas as pd
 
-ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$")
 NON_NEGATIVE_HINTS = ("quantity", "revenue", "price", "amount", "say", "gelir")
 
 
 def load_file(file) -> pd.DataFrame:
-    """CSV/Excel oxuyur. `file` yol (str) və ya Streamlit UploadedFile ola bilər."""
-    name = (file if isinstance(file, str) else getattr(file, "name", "")).lower()
+    """Read uploads without discarding identifier zeroes or guessing numeric separators."""
+    name = str(os.fspath(file) if isinstance(file, (str, os.PathLike))
+               else getattr(file, "name", "")).lower()
+    if name and not name.endswith((".csv", ".xlsx", ".xls")):
+        raise ValueError("Yalnız CSV və Excel (.xlsx/.xls) dəstəklənir.")
     if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(file)
-    if name.endswith(".csv") or not name:
-        return pd.read_csv(file)
-    raise ValueError("Yalnız CSV və Excel (.xlsx/.xls) dəstəklənir.")
+        frame = pd.read_excel(file, dtype=object, keep_default_na=False, na_values=[""])
+    else:
+        if isinstance(file, (str, os.PathLike)):
+            with open(file, "rb") as stream:
+                contents = stream.read()
+        elif hasattr(file, "getvalue"):
+            contents = file.getvalue()
+        else:
+            position = file.tell() if hasattr(file, "tell") else None
+            if hasattr(file, "seek"):
+                file.seek(0)
+            contents = file.read()
+            if position is not None and hasattr(file, "seek"):
+                file.seek(position)
+        try:
+            text = contents.decode("utf-8-sig") if isinstance(contents, bytes) else contents.lstrip("\ufeff")
+        except UnicodeDecodeError as exc:
+            raise ValueError("CSV UTF-8 formatında olmalıdır; faylı UTF-8 kimi yadda saxlayın.") from exc
+        if not text.strip():
+            raise ValueError("CSV faylı boşdur.")
+        try:
+            separator = csv.Sniffer().sniff(text[:8192], delimiters=",;\t|").delimiter
+        except csv.Error:
+            first_line = text.splitlines()[0]
+            separator = max(",;\t|", key=first_line.count) if any(x in first_line for x in ",;\t|") else ","
+        try:
+            reader = csv.reader(io.StringIO(text), delimiter=separator, strict=True)
+            header = next(row for row in reader if row and any(cell.strip() for cell in row))
+            if len(header) != len(set(header)):
+                raise ValueError("Datasetdə təkrarlanan sütun adları var.")
+            for row in reader:
+                if not row or (len(row) == 1 and not row[0].strip()):
+                    continue
+                if len(row) != len(header):
+                    raise ValueError("CSV sətirlərində sütun sayı başlıqla uyğun deyil.")
+            # Parse text first: pandas' default inference otherwise drops leading zeroes.
+            frame = pd.read_csv(io.StringIO(text), sep=separator, dtype=str,
+                                keep_default_na=False, na_values=[""])
+        except (pd.errors.ParserError, pd.errors.EmptyDataError, csv.Error, StopIteration) as exc:
+            raise ValueError("CSV oxuna bilmir; sütun ayırıcılarını və sətirləri yoxlayın.") from exc
+    if frame.empty or not len(frame.columns):
+        raise ValueError("Dataset boşdur; ən azı bir məlumat sətri lazımdır.")
+    for column in _text_cols(frame):
+        if not _is_identifier(column) and not is_date_col(column) and _numeric_like(frame[column]):
+            frame[column] = _convert_numeric_text(frame[column])
+    return frame
 
 
 def _is_text(s: pd.Series) -> bool:
@@ -26,6 +76,10 @@ def _is_text(s: pd.Series) -> bool:
 
 def _text_cols(df):
     return [c for c in df.columns if _is_text(df[c])]
+
+
+def _missing_mask(series: pd.Series) -> pd.Series:
+    return series.isna() | series.map(lambda value: isinstance(value, str) and not value.strip())
 
 
 DATE_RE = re.compile(
@@ -44,24 +98,71 @@ ID_HINTS = (
     "postal", "sku", "kod"
 )
 
+
+def _is_identifier(column) -> bool:
+    return any(hint in str(column).lower() for hint in ID_HINTS)
+
 def _numeric_like(s: pd.Series) -> bool:
     nn = s.dropna().astype(str).str.strip()
 
     if nn.empty:
         return False
 
-    if nn.str.match(r"^0\d+").any():
+    if nn.str.match(r"^[+-]?0\d+").any():
         return False
 
-    if nn.str.match(AMBIG_RE).any():
+    # A comma can mean either a decimal or a thousands separator; never guess.
+    if nn.str.contains(",", regex=False).any():
+        return False
+    if not nn.str.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?").all():
+        return False
+    try:
+        if nn.str.fullmatch(r"[+-]?\d+").all():
+            return all(-(2 ** 63) <= int(value) < 2 ** 63 for value in nn)
+        return all(math.isfinite(float(value)) for value in nn)
+    except (ValueError, OverflowError):
         return False
 
-    converted = pd.to_numeric(
-        nn.str.replace(",", ".", regex=False),
-        errors="coerce"
-    )
 
-    return bool(converted.notna().all())
+def _convert_numeric_text(series: pd.Series) -> pd.Series:
+    values = series.dropna().astype(str).str.strip()
+    integers = values.str.fullmatch(r"[+-]?\d+").all()
+    parsed = [pd.NA if pd.isna(value) else (int(str(value).strip()) if integers else float(str(value).strip()))
+              for value in series]
+    return pd.Series(parsed, index=series.index, name=series.name,
+                     dtype="Int64" if integers else "Float64")
+
+
+def _date_status(value) -> tuple:
+    """Classify dates conservatively. Locale-dependent dates remain unchanged."""
+    if pd.isna(value):
+        return "missing", None
+    if not isinstance(value, str):
+        if isinstance(value, (datetime, pd.Timestamp)):
+            return "valid", pd.Timestamp(value)
+        return "invalid", None
+    text = value.strip()
+    if ISO_RE.fullmatch(text):
+        try:
+            return "valid", pd.Timestamp(text)
+        except (ValueError, OverflowError):
+            return "invalid", None
+    numeric = re.fullmatch(r"(\d{1,2})([./-])(\d{1,2})\2(\d{4})", text)
+    if numeric:
+        first, second, year = int(numeric[1]), int(numeric[3]), int(numeric[4])
+        if 1 <= first <= 12 and 1 <= second <= 12 and first != second:
+            return "ambiguous", None
+        day, month = (second, first) if second > 12 else (first, second)
+        try:
+            return "valid", pd.Timestamp(datetime(year, month, day))
+        except ValueError:
+            return "invalid", None
+    for format_ in ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y"):
+        try:
+            return "valid", pd.Timestamp(datetime.strptime(text, format_))
+        except ValueError:
+            pass
+    return "invalid", None
 
 
 def _case_groups(s: pd.Series) -> dict:
@@ -83,7 +184,7 @@ def quality_report(df: pd.DataFrame) -> dict:
 
     # boş xanalar
     for c in df.columns:
-        m = int(df[c].isna().sum())
+        m = int(_missing_mask(df[c]).sum())
         if m:
             add("missing", c, m, f"'{c}' sütununda {m} boş xana (avtomatik doldurulmur, istifadəçi qərar verir)", False)
     # dublikatlar
@@ -101,26 +202,35 @@ def quality_report(df: pd.DataFrame) -> dict:
         g = _case_groups(df[c])
         if g:
             ex = "; ".join("/".join(sorted(v)) for v in list(g.values())[:2])
-            add("spelling", c, len(g), f"'{c}': fərqli yazılışlar ({ex})", True)
-        if _numeric_like(df[c]) and not is_date_col(c):
+            add("spelling", c, len(g), f"'{c}': fərqli yazılışlar ({ex}); istifadəçi qərarı tələb olunur", False)
+        if not _is_identifier(c) and _numeric_like(df[c]):
             add("dtype", c, len(s), f"'{c}' rəqəm kimi görünür, amma mətn tipindədir", True)
+        if not _is_identifier(c):
+            numeric_format = s.str.strip().str.fullmatch(r"[+-]?\d[\d., ]*") & s.str.contains(",", regex=False)
+            if numeric_format.any():
+                add("numeric_format", c, int(numeric_format.sum()),
+                    f"'{c}': vergüllü rəqəmlər qeyri-müəyyəndir; avtomatik çevrilmir", False)
     # tarix formatları
     for c in df.columns:
         if is_date_col(c):
             s = df[c].dropna()
             if _is_text(s):
                 s = s.astype(str).str.strip()
-                non_iso = int((~s.str.match(ISO_RE)).sum())
-                parsed = pd.to_datetime(s, format="mixed", dayfirst=True, errors="coerce")
-                bad = int(parsed.isna().sum())
+                statuses = s.map(lambda value: _date_status(value)[0])
+                non_iso = int(((statuses == "valid") & ~s.str.match(ISO_RE)).sum())
+                bad = int((statuses == "invalid").sum())
+                ambiguous = int((statuses == "ambiguous").sum())
                 if non_iso:
                     add("date_format", c, non_iso, f"'{c}': {non_iso} tarix ISO (YYYY-MM-DD) formatında deyil", True)
                 if bad:
                     add("date_invalid", c, bad, f"'{c}': {bad} tarix oxuna bilmir", False)
+                if ambiguous:
+                    add("date_ambiguous", c, ambiguous,
+                        f"'{c}': {ambiguous} tarixdə gün/ay sırası qeyri-müəyyəndir; avtomatik dəyişdirilmir", False)
     # şübhəli rəqəmlər
     for c in df.select_dtypes("number").columns:
         s = df[c].dropna()
-        if any(h in c.lower() for h in NON_NEGATIVE_HINTS):
+        if any(h in str(c).lower() for h in NON_NEGATIVE_HINTS):
             neg = int((s < 0).sum())
             if neg:
                 add("negative", c, neg, f"'{c}': {neg} mənfi dəyər (şübhəli)", False)
@@ -137,40 +247,39 @@ def quality_report(df: pd.DataFrame) -> dict:
             "score": max(0, int(100 - penalty))}
 
 
-def apply_safe_fixes(df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
-    """Yalnız təhlükəsiz düzəlişlər. Boş dəyərlər və outlier-lərə TOXUNMUR."""
-    out, log = df.copy(), []
+def apply_safe_fixes(df: pd.DataFrame, approved: bool = False) -> Tuple[pd.DataFrame, list]:
+    """Apply approved, conservative fixes to a copy; uncertain values stay intact."""
+    if approved is not True:
+        raise PermissionError("Data dəyişiklikləri istifadəçi təsdiqi tələb edir.")
+    out, log = df.copy(deep=True), []
     for c in _text_cols(out):
         if is_date_col(c):
             continue
         before = out[c].copy()
-        out[c] = out[c].where(out[c].isna(), out[c].astype(str).str.strip().str.replace(r"\s+", " ", regex=True))
-        n = int((before.fillna("") != out[c].fillna("")).sum())
+        out[c] = out[c].map(lambda value: re.sub(r"\s+", " ", value.strip())
+                            if isinstance(value, str) else value)
+        n = int((before.astype("object").fillna("") != out[c].astype("object").fillna("")).sum())
         if n:
             log.append(f"'{c}': {n} dəyərdə artıq boşluq təmizləndi")
-        g = _case_groups(out[c])
-        if g:
-            counts = out[c].value_counts()
-            mapping = {}
-            for variants in g.values():
-                best = max(variants, key=lambda v: counts.get(v, 0))
-                mapping.update({v: best for v in variants})
-            changed = int(out[c].isin([v for v in mapping if mapping[v] != v]).sum())
-            out[c] = out[c].replace(mapping)
-            log.append(f"'{c}': {changed} dəyərdə yazılış vahid formaya salındı")
         if (
-            not any(h in str(c).lower() for h in ID_HINTS)
+            not _is_identifier(c)
             and _numeric_like(out[c])
         ):
-            out[c] = pd.to_numeric(out[c].astype(str).str.strip().str.replace(",", ".", regex=False), errors="coerce")
+            out[c] = _convert_numeric_text(out[c])
             log.append(f"'{c}': mətn → rəqəm tipinə çevrildi")
     for c in out.columns:
         if is_date_col(c) and _is_text(out[c]):
-            parsed = pd.to_datetime(out[c].astype(str).str.strip(), format="mixed", dayfirst=True, errors="coerce")
-            parsed[out[c].isna()] = pd.NaT
-            bad = int(parsed.isna().sum() - out[c].isna().sum())
-            out[c] = parsed
-            log.append(f"'{c}': tarixlər vahid formata (YYYY-MM-DD) salındı" + (f", {bad} oxunmadı" if bad else ""))
+            def normalize_date(value):
+                status, parsed = _date_status(value)
+                if status != "valid" or not isinstance(value, str):
+                    return value
+                # Date-only values remain date-only; timestamps retain their time/zone.
+                return parsed.isoformat() if ("T" in value or re.search(r"\d{2}:\d{2}", value)) else parsed.date().isoformat()
+            before = out[c].copy()
+            out[c] = out[c].map(normalize_date)
+            count = int((before.astype("object").fillna("") != out[c].astype("object").fillna("")).sum())
+            if count:
+                log.append(f"'{c}': {count} dəqiq tarix ISO formatına çevrildi; qeyri-müəyyən tarixlər saxlanıldı")
     dups = int(out.duplicated().sum())
     if dups:
         out = out.drop_duplicates().reset_index(drop=True)
@@ -224,7 +333,7 @@ def validate_cleaning_plan(plan: dict, df: pd.DataFrame) -> list:
 
         action = op.get("action")
 
-        if action not in ALLOWED_CLEANING_ACTIONS:
+        if not isinstance(action, str) or action not in ALLOWED_CLEANING_ACTIONS:
             raise ValueError(f"Qadağan edilmiş əməliyyat: {action}")
 
         if set(op) != ACTION_FIELDS[action]:
@@ -241,7 +350,7 @@ def validate_cleaning_plan(plan: dict, df: pd.DataFrame) -> list:
                 raise ValueError("Whitespace yalnız mətn sütununa tətbiq edilir.")
 
         if action == "fill_missing":
-            if op["method"] != "median":
+            if not isinstance(op["method"], str) or op["method"] != "median":
                 raise ValueError("Yalnız median metodu dəstəklənir.")
 
             if not pd.api.types.is_numeric_dtype(df[column]):
@@ -252,13 +361,13 @@ def validate_cleaning_plan(plan: dict, df: pd.DataFrame) -> list:
                     raise ValueError("Median hesablamaq üçün rəqəm yoxdur.")
             else:
                 raise ValueError("Boolean və complex sütunlar dəstəklənmir.")
+            median = df[column].median()
+            if pd.isna(median) or not math.isfinite(float(median)):
+                raise ValueError("Sonlu median hesablamaq üçün rəqəm yoxdur.")
 
         validated.append({
             **op,
-            "requires_approval": action in {
-                "fill_missing",
-                "remove_duplicates",
-            }
+            "requires_approval": True,
         })
 
     return validated
@@ -273,7 +382,7 @@ def apply_cleaning_plan(
 
     operations = validate_cleaning_plan(plan, df)
 
-    if any(op["requires_approval"] for op in operations) and not approved:
+    if operations and approved is not True:
         raise PermissionError(
             "Bu cleaning plan istifadəçi təsdiqi tələb edir."
         )
@@ -294,7 +403,7 @@ def apply_cleaning_plan(
             )
 
             changed = int(
-                (before.fillna("") != result[column].fillna("")).sum()
+                (before.astype("object").fillna("") != result[column].astype("object").fillna("")).sum()
             )
             log.append(f"{column}: {changed} mətn təmizləndi")
 
@@ -303,12 +412,15 @@ def apply_cleaning_plan(
             count = int(result[column].isna().sum())
             median = result[column].median()
 
-            if pd.isna(median):
+            if pd.isna(median) or not math.isfinite(float(median)):
                 raise ValueError("Median hesablana bilmir.")
 
+            if pd.api.types.is_integer_dtype(result[column].dtype) and float(median) % 1:
+                # Nullable integer arrays reject a fractional median. Promote the copy.
+                result[column] = result[column].astype("Float64")
             result[column] = result[column].fillna(median)
             log.append(
-                f"{column}: {count} boş xana median ilə dolduruldu"
+                f"{column}: {count} boş xana median ({median}) ilə dolduruldu"
             )
 
         elif action == "remove_duplicates":
@@ -339,5 +451,7 @@ def preview_cleaning_plan(df: pd.DataFrame, plan: dict) -> dict:
         "operations": operations,
         "log": log,
         "preview_data": preview_df,
+        "before_report": quality_report(df),
+        "after_report": quality_report(preview_df),
     }
 
