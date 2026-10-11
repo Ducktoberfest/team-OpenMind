@@ -152,3 +152,166 @@ def apply_safe_fixes(df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
     if not log:
         log.append("Təhlükəsiz düzəliş lazım olmadı")
     return out, log
+
+
+
+# ===== AI CLEANING PLAN =====
+
+ALLOWED_CLEANING_ACTIONS = {
+    "trim_whitespace",
+    "fill_missing",
+    "remove_duplicates",
+}
+
+ACTION_FIELDS = {
+    "trim_whitespace": {"action", "column"},
+    "fill_missing": {"action", "column", "method"},
+    "remove_duplicates": {"action"},
+}
+
+
+def validate_cleaning_plan(plan: dict, df: pd.DataFrame) -> list:
+    """AI planını yoxlayır, amma datanı dəyişmir."""
+
+    if not isinstance(plan, dict):
+        raise ValueError("Cleaning plan JSON obyekt olmalıdır.")
+
+    if set(plan) != {"operations"}:
+        raise ValueError("Plan yalnız 'operations' açarını qəbul edir.")
+
+    operations = plan["operations"]
+
+    if not isinstance(operations, list):
+        raise ValueError("'operations' siyahı olmalıdır.")
+
+    if len(operations) > 20:
+        raise ValueError("Maksimum 20 əməliyyata icazə verilir.")
+
+    if not df.columns.is_unique:
+        raise ValueError("Datasetdə təkrarlanan sütun adları var.")
+
+    validated = []
+
+    for op in operations:
+        if not isinstance(op, dict):
+            raise ValueError("Hər əməliyyat JSON obyekt olmalıdır.")
+
+        action = op.get("action")
+
+        if action not in ALLOWED_CLEANING_ACTIONS:
+            raise ValueError(f"Qadağan edilmiş əməliyyat: {action}")
+
+        if set(op) != ACTION_FIELDS[action]:
+            raise ValueError(f"Yanlış parametrlər: {action}")
+
+        column = op.get("column")
+
+        if action != "remove_duplicates":
+            if not isinstance(column, str) or column not in df.columns:
+                raise ValueError(f"Sütun tapılmadı: {column}")
+
+        if action == "trim_whitespace":
+            if not _is_text(df[column]):
+                raise ValueError("Whitespace yalnız mətn sütununa tətbiq edilir.")
+
+        if action == "fill_missing":
+            if op["method"] != "median":
+                raise ValueError("Yalnız median metodu dəstəklənir.")
+
+            if not pd.api.types.is_numeric_dtype(df[column]):
+                raise ValueError("Median yalnız rəqəmsal sütuna tətbiq edilir.")
+
+            if not pd.api.types.is_bool_dtype(df[column]) and not pd.api.types.is_complex_dtype(df[column]):
+                if not pd.to_numeric(df[column], errors="coerce").notna().any():
+                    raise ValueError("Median hesablamaq üçün rəqəm yoxdur.")
+            else:
+                raise ValueError("Boolean və complex sütunlar dəstəklənmir.")
+
+        validated.append({
+            **op,
+            "requires_approval": action in {
+                "fill_missing",
+                "remove_duplicates",
+            }
+        })
+
+    return validated
+
+
+def apply_cleaning_plan(
+    df: pd.DataFrame,
+    plan: dict,
+    approved: bool = False
+) -> tuple:
+    """Planı yoxlayır və icazəli əməliyyatları surət üzərində icra edir."""
+
+    operations = validate_cleaning_plan(plan, df)
+
+    if any(op["requires_approval"] for op in operations) and not approved:
+        raise PermissionError(
+            "Bu cleaning plan istifadəçi təsdiqi tələb edir."
+        )
+
+    result = df.copy(deep=True)
+    log = []
+
+    for op in operations:
+        action = op["action"]
+
+        if action == "trim_whitespace":
+            column = op["column"]
+            before = result[column].copy()
+
+            result[column] = result[column].map(
+                lambda x: re.sub(r"\s+", " ", x.strip())
+                if isinstance(x, str) else x
+            )
+
+            changed = int(
+                (before.fillna("") != result[column].fillna("")).sum()
+            )
+            log.append(f"{column}: {changed} mətn təmizləndi")
+
+        elif action == "fill_missing":
+            column = op["column"]
+            count = int(result[column].isna().sum())
+            median = result[column].median()
+
+            if pd.isna(median):
+                raise ValueError("Median hesablana bilmir.")
+
+            result[column] = result[column].fillna(median)
+            log.append(
+                f"{column}: {count} boş xana median ilə dolduruldu"
+            )
+
+        elif action == "remove_duplicates":
+            count = int(result.duplicated().sum())
+            result = result.drop_duplicates().reset_index(drop=True)
+            log.append(f"{count} dublikat sətir silindi")
+
+    return result, log
+
+
+def preview_cleaning_plan(df: pd.DataFrame, plan: dict) -> dict:
+    """Təklif edilən dəyişiklikləri orijinal dataya toxunmadan göstərir."""
+
+    operations = validate_cleaning_plan(plan, df)
+
+    # Bu yalnız simulyasiyadır, istifadəçi təsdiqi deyil.
+    preview_df, log = apply_cleaning_plan(
+        df, plan, approved=True
+    )
+
+    return {
+        "original_rows": len(df),
+        "preview_rows": len(preview_df),
+        "rows_removed": len(df) - len(preview_df),
+        "requires_approval": any(
+            op["requires_approval"] for op in operations
+        ),
+        "operations": operations,
+        "log": log,
+        "preview_data": preview_df,
+    }
+
