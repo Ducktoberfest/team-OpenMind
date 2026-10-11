@@ -28,17 +28,40 @@ def _text_cols(df):
     return [c for c in df.columns if _is_text(df[c])]
 
 
-def is_date_col(name: str) -> bool:
-    n = name.lower()
-    return "date" in n or "tarix" in n
+DATE_RE = re.compile(
+    r"(^|[_\s\-])(date|tarix)($|[_\s\-])",
+    re.IGNORECASE
+)
 
+def is_date_col(name: str) -> bool:
+    return bool(DATE_RE.search(str(name)))
+
+
+AMBIG_RE = re.compile(r"^\s*[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*$")
+
+ID_HINTS = (
+    "id", "code", "phone", "zip",
+    "postal", "sku", "kod"
+)
 
 def _numeric_like(s: pd.Series) -> bool:
     nn = s.dropna().astype(str).str.strip()
+
     if nn.empty:
         return False
-    conv = pd.to_numeric(nn.str.replace(",", ".", regex=False), errors="coerce")
-    return conv.notna().mean() >= 0.9
+
+    if nn.str.match(r"^0\d+").any():
+        return False
+
+    if nn.str.match(AMBIG_RE).any():
+        return False
+
+    converted = pd.to_numeric(
+        nn.str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
+
+    return bool(converted.notna().all())
 
 
 def _case_groups(s: pd.Series) -> dict:
@@ -135,7 +158,10 @@ def apply_safe_fixes(df: pd.DataFrame) -> Tuple[pd.DataFrame, list]:
             changed = int(out[c].isin([v for v in mapping if mapping[v] != v]).sum())
             out[c] = out[c].replace(mapping)
             log.append(f"'{c}': {changed} dəyərdə yazılış vahid formaya salındı")
-        if _numeric_like(out[c]):
+        if (
+            not any(h in str(c).lower() for h in ID_HINTS)
+            and _numeric_like(out[c])
+        ):
             out[c] = pd.to_numeric(out[c].astype(str).str.strip().str.replace(",", ".", regex=False), errors="coerce")
             log.append(f"'{c}': mətn → rəqəm tipinə çevrildi")
     for c in out.columns:
