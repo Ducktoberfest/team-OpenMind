@@ -6,17 +6,20 @@ import re
 
 import requests
 
-from data_analyzer import validate_op
+from data_analyzer import GROUP_OPS, validate_op
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
-TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))  # saniyə (CPU-da yavaş ola bilər)
+TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))  # ilk yükləmə / ümumi limit (saniyə)
+PARSE_TIMEOUT = int(os.getenv("OLLAMA_PARSE_TIMEOUT", "30"))  # sual -> JSON (qısa: yavaşdırsa ehtiyat rejim)
+EXPLAIN_TIMEOUT = int(os.getenv("OLLAMA_EXPLAIN_TIMEOUT", "60"))  # nəticə -> izah
 
 PARSE_SYSTEM = """You convert a user's data question into ONE JSON operation. Return ONLY JSON, no text.
 Allowed "op": sum, mean, min, max, count, group_sum, group_mean, group_count, trend.
 Fields: op, metric (numeric column), group_by (column, for group_* ops), top_n (int, optional),
 ascending (bool, optional), date_col (for trend), freq ("M" for monthly, for trend), filters (optional list of
 {{"column":..,"operator":"==|!=|>|<|>=|<=|contains","value":..}}).
+Do NOT include fields that are not needed (no null values).
 Dataset columns (name: type):
 {columns_info}
 Default metric: {metric}. Default date column: {date}.
@@ -31,8 +34,8 @@ Q: How many rows are there? -> {{"op":"count"}}"""
 
 EXPLAIN_SYSTEM = """You are a business data analyst. Explain the RESULT to the user in the same language as the
 question (Azerbaijani if the question is Azerbaijani). Use ONLY numbers present in RESULT. NEVER invent
-numbers and NEVER claim a cause that the data does not show. Maximum 4 sentences, then give 1-2 short
-practical recommendations phrased as things to check or try."""
+numbers and NEVER claim a cause that the data does not show. Maximum 3 short sentences, then ONE short
+practical recommendation phrased as something to check or try."""
 
 _parse_cache: dict = {}
 _explain_cache: dict = {}
@@ -42,7 +45,7 @@ _explain_cache: dict = {}
 def _chat(system: str, user: str, json_mode: bool = False, timeout: int | None = None,
           max_tokens: int = 1024) -> str:
     payload = {
-        "model": MODEL, "stream": False, "keep_alive": "30m", "think": False,
+        "model": MODEL, "stream": False, "keep_alive": "2h", "think": False,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "options": {"temperature": 0.1, "num_predict": max_tokens, "num_ctx": 2048},
     }
@@ -54,8 +57,13 @@ def _chat(system: str, user: str, json_mode: bool = False, timeout: int | None =
 
 
 def ollama_available() -> bool:
+    """Ollama serveri işləyir VƏ MODEL yüklənib?"""
     try:
-        return requests.get(f"{OLLAMA_URL}/api/tags", timeout=2).ok
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        if not r.ok:
+            return False
+        names = {m.get("name", "") for m in r.json().get("models", [])}
+        return MODEL in names or f"{MODEL}:latest" in names
     except Exception:
         return False
 
@@ -71,6 +79,27 @@ def warm_up() -> None:
 def _extract_json(text: str) -> dict:
     m = re.search(r"\{.*\}", text, re.S)
     return json.loads(m.group(0) if m else text)
+
+
+def normalize_op(op):
+    """Modelin tez-tez etdiyi kiçik səhvləri düzəldir: null sahələri və əməliyyata
+    aid olmayan açarları silir, top_n-i int-ə çevirir. Sonra validate_op yoxlayır."""
+    if not isinstance(op, dict):
+        return op
+    kind = op.get("op")
+    if kind in GROUP_OPS:
+        allowed = {"op", "metric", "group_by", "top_n", "ascending", "filters"}
+    elif kind == "trend":
+        allowed = {"op", "metric", "date_col", "freq", "filters"}
+    else:
+        allowed = {"op", "metric", "filters"}
+    clean = {k: v for k, v in op.items() if k in allowed and v is not None and v != []}
+    if "top_n" in clean:
+        try:
+            clean["top_n"] = int(clean["top_n"])
+        except (TypeError, ValueError):
+            clean.pop("top_n")
+    return clean
 
 
 # ---------------------------------------------------------------- sual -> JSON
@@ -93,9 +122,8 @@ def _fallback_parse(question: str, columns: list, ctx: dict) -> dict:
 
 def parse_question(question: str, columns: list, ctx: dict | None = None, retries: int = 2) -> dict:
     """sual -> doğrulanmış JSON əməliyyat. Model uğursuz olarsa ehtiyat parser.
-
     ctx (hamısı ixtiyari): {"dtypes": {col: tip}, "numeric": [...], "categorical": [...],
-                            "metric": str, "date": str, "values": {col: [nümunə dəyərlər]}}"""
+    "metric": str, "date": str, "values": {col: [nümunə dəyərlər]}}"""
     ctx = ctx or {}
     key = (question.strip().lower(), tuple(columns), ctx.get("metric"), ctx.get("date"))
     if key in _parse_cache:
@@ -110,15 +138,20 @@ def parse_question(question: str, columns: list, ctx: dict | None = None, retrie
         for c in columns)
     sys_prompt = PARSE_SYSTEM.format(columns_info=info, metric=metric, date=ctx.get("date") or "none",
                                      dim=cats[0] if cats else columns[0])
+
     op = None
     for _ in range(retries):
         try:
-            op = validate_op(_extract_json(_chat(sys_prompt, question, json_mode=True, max_tokens=300)), columns)
+            raw = _extract_json(_chat(sys_prompt, question, json_mode=True,
+                                      max_tokens=300, timeout=PARSE_TIMEOUT))
+            op = validate_op(normalize_op(raw), columns)
             break
         except (requests.Timeout, requests.ConnectionError):
             break  # model əlçatmazdır/çox yavaşdır: təkrar gözləmə, dərhal ehtiyat rejim
+        except requests.HTTPError:
+            break  # məs. model yüklənməyib (404): təkrar cəhd mənasızdır
         except Exception:
-            continue  # kəsilmiş/boş JSON: bir də cəhd et
+            continue  # kəsilmiş/boş/yanlış JSON: bir də cəhd et
     if op is None:
         op = validate_op(_fallback_parse(question, columns, ctx), columns)
     _parse_cache[key] = dict(op)
@@ -131,7 +164,7 @@ def explain_result(question: str, result: dict) -> str:
     if payload in _explain_cache:
         return _explain_cache[payload]
     try:
-        text = _chat(EXPLAIN_SYSTEM, payload, max_tokens=400).strip()
+        text = _chat(EXPLAIN_SYSTEM, payload, max_tokens=200, timeout=EXPLAIN_TIMEOUT).strip()
     except Exception:
         return _template_explain(result)
     text = text or _template_explain(result)

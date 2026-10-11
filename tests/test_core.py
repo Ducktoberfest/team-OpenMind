@@ -51,6 +51,23 @@ def test_rejects_bad_ops(clean):
 
 def test_fallback_parser(clean):
     ai_agent.OLLAMA_URL = "http://127.0.0.1:9"  # model yoxdur
-    op = ai_agent.parse_question("Hansı məhsul daha çox gəlir gətirib?", list(clean.columns), ["Quantity", "Revenue"], retries=1)
+    ctx = {"numeric": ["Quantity", "Revenue"], "categorical": ["Product", "Region"], "metric": "Revenue", "date": "Date"}
+    op = ai_agent.parse_question("Hansı Product daha çox gəlir gətirib?", list(clean.columns), ctx, retries=1)
     assert op["op"] == "group_sum" and op["group_by"] == "Product"
     assert "Nəticə" in ai_agent.explain_result("x", {"op": "sum", "metric": "Revenue", "value": 5})
+
+
+def test_other_schema_works(clean):
+    """Tamam fərqli sütun adları olan dataset də işləməlidir."""
+    from data_cleaner import date_columns
+    other = clean.rename(columns={"Date": "Order Day", "Product": "Item", "Revenue": "Sales", "Region": "Store"})
+    other["Order Day"] = other["Order Day"].dt.strftime("%d.%m.%Y")
+    assert date_columns(other) == ["Order Day"]
+    fixed, _ = apply_safe_fixes(other)
+    assert pd.api.types.is_datetime64_any_dtype(fixed["Order Day"])
+    r = run_operation(fixed, {"op": "trend", "metric": "Sales"})
+    assert len(r["table"]) >= 11
+    ai_agent.OLLAMA_URL = "http://127.0.0.1:9"
+    ctx = {"numeric": ["Quantity", "Sales"], "categorical": ["Store", "Item"], "metric": "Sales", "date": "Order Day"}
+    op = ai_agent.parse_question("Which one sold the most?", list(fixed.columns), ctx, retries=1)
+    assert op["op"] == "group_sum" and op["metric"] == "Sales"
